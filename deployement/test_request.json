@@ -1,0 +1,16 @@
+{
+  "amount": 2500.50,
+  "hour": 23,
+  "day_of_week": "Friday",
+  "device_type": "Android",
+  "transaction_type": "transfer",
+  "user_txn_count": 25,
+  "user_avg_amount": 800.0,
+  "user_std_amount": 200.0,
+  "rolling_fraud_rate_user_7d": 0.4,
+  "user_fraud_rate": 0.2,
+  "amount_zscore_user": 1.8,
+  "merchant_fraud_rate": 0.1,
+  "peer_spend_ratio": 1.5,
+  "weighted_amount": 2100.0
+}
