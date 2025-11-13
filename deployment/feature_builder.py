@@ -17,24 +17,40 @@ def _safe_datetime(ts):
 
 
 def load_history():
+    required_cols = [
+        "transaction_id", "user_id", "merchant_id", "amount",
+        "timestamp", "device_type", "transaction_type", "location",
+        "is_fraud"
+    ]
+
     try:
-        return pd.read_csv(HISTORY_PATH, parse_dates=["timestamp"])
+        df = pd.read_csv(HISTORY_PATH, parse_dates=["timestamp"])
+        if not set(required_cols).issubset(df.columns):
+            return pd.DataFrame(columns=required_cols)
+        return df
     except:
-        return pd.DataFrame(columns=[
-            "transaction_id", "user_id", "merchant_id", "amount",
-            "timestamp", "device_type", "transaction_type", "location", "is_fraud"
-        ])
+        return pd.DataFrame(columns=required_cols)
 
 
 def save_history_row(row_dict):
     os.makedirs("../data/state", exist_ok=True)
+
+    required_cols = [
+        "transaction_id", "user_id", "merchant_id", "amount",
+        "timestamp", "device_type", "transaction_type", "location",
+        "is_fraud"
+    ]
+
+    # Ensure missing columns are filled with None/0
+    safe_row = {col: row_dict.get(col, None) for col in required_cols}
+
     file_exists = os.path.exists(HISTORY_PATH)
 
     with open(HISTORY_PATH, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=row_dict.keys())
+        writer = csv.DictWriter(f, fieldnames=required_cols)
         if not file_exists:
             writer.writeheader()
-        writer.writerow(row_dict)
+        writer.writerow(safe_row)
 
 
 def append_api_log(log_dict):
