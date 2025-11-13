@@ -7,23 +7,26 @@ import datetime
 import os
 
 from model_loader import load_model_and_schema
-from feature_builder import build_features_from_raw, append_api_log, save_history_row, load_history
+from feature_builder import (
+    build_features_from_raw,
+    append_api_log,
+    save_history_row,
+    load_history
+)
 
-# Load model & schema at import
-model, MODEL_FEATURE_LIST = load_model_and_schema()
+# Load model, schema, training_df
+model, MODEL_FEATURE_LIST, TRAINING_DF = load_model_and_schema()
 
-app = FastAPI(title="Mobile Fraud Detection - Real-time (Stateful)")
+app = FastAPI(title="Mobile Fraud Detection - Raw Input API")
 
-# Make sure no timestamp/is_fraud in schema
-MODEL_FEATURE_LIST = [
-    f for f in MODEL_FEATURE_LIST if f not in ("timestamp", "is_fraud")]
-
-# ensure folders
+# Ensure directories exist
 os.makedirs("../data/state", exist_ok=True)
 os.makedirs("../reports", exist_ok=True)
-os.makedirs("../models", exist_ok=True)
 
 
+# ---------------------------
+#  INPUT SCHEMA
+# ---------------------------
 class RawTransaction(BaseModel):
     transaction_id: str | None = None
     user_id: int | None = None
@@ -35,64 +38,98 @@ class RawTransaction(BaseModel):
     location: str | None = "Unknown"
 
 
+# ---------------------------
+#  ROOT ENDPOINT
+# ---------------------------
 @app.get("/")
 def root():
-    return {"status": "API Running Successfully 🚀", "model_features": len(MODEL_FEATURE_LIST)}
+    return {
+        "status": "API Running Successfully 🚀",
+        "model_features": len(MODEL_FEATURE_LIST),
+        "schema_endpoint": "/schema"
+    }
 
 
+# ---------------------------
+#  FEATURE SCHEMA PREVIEW
+# ---------------------------
 @app.get("/schema")
-def schema():
-    return {"feature_count": len(MODEL_FEATURE_LIST), "features": MODEL_FEATURE_LIST}
+def get_schema():
+    return {
+        "feature_count": len(MODEL_FEATURE_LIST),
+        "features": MODEL_FEATURE_LIST
+    }
 
 
+# ---------------------------
+#  PREDICTION ENDPOINT
+# ---------------------------
 @app.post("/predict")
 def predict(txn: RawTransaction):
+
+    # convert input to dict
     try:
         raw = txn.dict()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Invalid input: {e}")
 
-    # Build features (history-driven)
-    feature_vector, enriched = build_features_from_raw(raw, MODEL_FEATURE_LIST)
+    # Build features (safe + stable)
+    try:
+        feature_vector, enriched_for_history = build_features_from_raw(
+            raw, MODEL_FEATURE_LIST
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Feature error: {e}")
 
-    # Ensure numeric and correct shape/order
+    # Convert to numeric (ensure no dtype issues)
     feature_vector = feature_vector.apply(
         pd.to_numeric, errors="coerce").fillna(0)
-    feature_vector = feature_vector.reindex(
-        columns=MODEL_FEATURE_LIST, fill_value=0)
 
-    # Convert to numpy array for model
-    X_in = feature_vector.values
-
+    # Ensure correct shape
     try:
-        prob = float(model.predict_proba(X_in)[:, 1][0])
+        X_in = feature_vector[MODEL_FEATURE_LIST]
+    except Exception:
+        # fallback fill for missing columns
+        for feat in MODEL_FEATURE_LIST:
+            if feat not in feature_vector.columns:
+                feature_vector[feat] = 0
+        X_in = feature_vector[MODEL_FEATURE_LIST]
+
+    # -----------------
+    # MODEL PREDICTION
+    # -----------------
+    try:
+        prob = float(model.predict_proba(X_in.values)[:, 1][0])
     except Exception as e:
-        # log some diagnostics
-        import traceback
-        traceback.print_exc()
         raise HTTPException(
-            status_code=500, detail=f"Model prediction error: {e}")
+            status_code=500, detail=f"Model prediction Error: {e}")
 
     fraud_flag = bool(prob > 0.5)
 
-    # log and history
+    # -----------------
+    # LOGGING + HISTORY
+    # -----------------
     log_entry = {
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "transaction_id": raw.get("transaction_id"),
         "user_id": raw.get("user_id"),
         "merchant_id": raw.get("merchant_id"),
         "amount": raw.get("amount"),
-        "device_type": raw.get("device_type"),
         "transaction_type": raw.get("transaction_type"),
+        "device_type": raw.get("device_type"),
         "location": raw.get("location"),
         "fraud_probability": round(prob, 4),
-        "fraud_flag": int(fraud_flag)
+        "fraud_flag": fraud_flag
     }
+
+    # enriched state row (store predicted flag)
+    enriched_for_history["timestamp"] = datetime.datetime.utcnow().isoformat()
+    enriched_for_history["is_fraud"] = int(fraud_flag)
+
     append_api_log(log_entry)
+    save_history_row(enriched_for_history)
 
-    # update history record and save
-    enriched["is_fraud"] = int(fraud_flag)
-    enriched["timestamp"] = datetime.datetime.utcnow().isoformat()
-    save_history_row(enriched)
-
-    return {"fraud_probability": round(prob, 4), "fraud_flag": fraud_flag}
+    return {
+        "fraud_probability": round(prob, 4),
+        "fraud_flag": fraud_flag
+    }
