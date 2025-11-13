@@ -69,6 +69,7 @@ def build_features_from_raw(raw_txn: dict, model_feature_list: list, training_df
 
     # Load history
     hist = load_history()
+    # Drop timestamp/is_fraud if accidentally added
 
     # Normalize input
     txn = raw_txn.copy()

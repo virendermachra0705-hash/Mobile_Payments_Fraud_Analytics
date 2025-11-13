@@ -63,6 +63,10 @@ def predict(txn: RawTransaction):
                 booster.feature_names = MODEL_FEATURE_LIST
         except Exception:
             pass
+        drop_cols = ["timestamp", "is_fraud"]
+        for c in drop_cols:
+            if c in feature_vector.columns:
+                feature_vector = feature_vector.drop(columns=[c])
 
         X_in = feature_vector[MODEL_FEATURE_LIST]
     except Exception as e:
