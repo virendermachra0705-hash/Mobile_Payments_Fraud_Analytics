@@ -1,4 +1,4 @@
-# fraud_api.py (Option A production-ready)
+# fraud_api.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pandas as pd
@@ -9,16 +9,16 @@ import os
 from model_loader import load_model_and_schema
 from feature_builder import build_features_from_raw, append_api_log, save_history_row, load_history
 
-# Load model + schema
+# Load model & schema at import
 model, MODEL_FEATURE_LIST = load_model_and_schema()
 
-# Ensure we never include target/timestamp in schema
+app = FastAPI(title="Mobile Fraud Detection - Real-time (Stateful)")
+
+# Make sure no timestamp/is_fraud in schema
 MODEL_FEATURE_LIST = [
     f for f in MODEL_FEATURE_LIST if f not in ("timestamp", "is_fraud")]
 
-app = FastAPI(title="Mobile Fraud Detection - Real-time (History-driven)")
-
-# ensure directories exist
+# ensure folders
 os.makedirs("../data/state", exist_ok=True)
 os.makedirs("../reports", exist_ok=True)
 os.makedirs("../models", exist_ok=True)
@@ -37,11 +37,12 @@ class RawTransaction(BaseModel):
 
 @app.get("/")
 def root():
-    return {
-        "status": "API Running Successfully 🚀",
-        "model_features": len(MODEL_FEATURE_LIST),
-        "schema_preview": MODEL_FEATURE_LIST[:10]
-    }
+    return {"status": "API Running Successfully 🚀", "model_features": len(MODEL_FEATURE_LIST)}
+
+
+@app.get("/schema")
+def schema():
+    return {"feature_count": len(MODEL_FEATURE_LIST), "features": MODEL_FEATURE_LIST}
 
 
 @app.post("/predict")
@@ -49,33 +50,32 @@ def predict(txn: RawTransaction):
     try:
         raw = txn.dict()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid input: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
-    # Build feature vector from history only
+    # Build features (history-driven)
     feature_vector, enriched = build_features_from_raw(raw, MODEL_FEATURE_LIST)
 
-    # Force numeric and fillna
+    # Ensure numeric and correct shape/order
     feature_vector = feature_vector.apply(
         pd.to_numeric, errors="coerce").fillna(0)
-
-    # Ensure exact ordering and presence
     feature_vector = feature_vector.reindex(
         columns=MODEL_FEATURE_LIST, fill_value=0)
 
-    # Convert to numpy for XGBoost
+    # Convert to numpy array for model
     X_in = feature_vector.values
 
-    # Predict probability
     try:
         prob = float(model.predict_proba(X_in)[:, 1][0])
     except Exception as e:
-        # provide a helpful log message
+        # log some diagnostics
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
-            status_code=500, detail=f"Model predict error: {e}")
+            status_code=500, detail=f"Model prediction error: {e}")
 
     fraud_flag = bool(prob > 0.5)
 
-    # Prepare API log
+    # log and history
     log_entry = {
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "transaction_id": raw.get("transaction_id"),
@@ -90,9 +90,8 @@ def predict(txn: RawTransaction):
     }
     append_api_log(log_entry)
 
-    # Save enriched history (update is_fraud with predicted flag)
+    # update history record and save
     enriched["is_fraud"] = int(fraud_flag)
-    # timestamp: ensure ISO string (already provided by feature_builder) but override to now for consistent ordering
     enriched["timestamp"] = datetime.datetime.utcnow().isoformat()
     save_history_row(enriched)
 
