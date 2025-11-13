@@ -180,6 +180,10 @@ def build_features_from_raw(raw_txn: dict, model_feature_list: list):
         merchant_unique_users = 0
         merchant_fraud_rate = median_merchant_fraud
         merchant_past_fraud_rate = median_merchant_fraud
+    if merchant_txn_count > 0:
+        merchant_user_overlap = merchant_unique_users / merchant_txn_count
+    else:
+        merchant_user_overlap = 0.0
 
     # device and location stats
     if "device_type" in hist.columns:
