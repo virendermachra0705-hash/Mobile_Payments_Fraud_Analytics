@@ -1,51 +1,50 @@
 # model_loader.py
 import joblib
-import pandas as pd
+import os
+import json
 
-TRAIN_FEATURES_PATH = "../data/processed/features_enriched_v2.csv"
 MODEL_PATH = "../models/xgboost_tuned.pkl"
-
+ALT_FEATURES_PATH = "../models/feature_names.txt"  # optional: one feature per line
 
 def load_model_and_schema():
     """
-    Loads trained XGBoost model and the training schema (feature columns and basic stats).
-    Returns:
-      model: loaded sklearn XGBClassifier
-      feature_columns: list of columns expected by the model (prefers booster.feature_names)
-      training_df: DataFrame loaded from features_enriched_v2.csv (used to compute baseline stats)
+    Load serialized model and extract its expected feature list.
+    Returns: model, feature_list
     """
-    print("Loading training schema from:", TRAIN_FEATURES_PATH)
-    training_df = pd.read_csv(TRAIN_FEATURES_PATH)
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model not found at {MODEL_PATH}. Please place your trained model there.")
 
-    # keep a copy of training columns (exclude target if present)
-    if "is_fraud" in training_df.columns:
-        feature_columns = [c for c in training_df.columns if c != "is_fraud"]
-    else:
-        feature_columns = training_df.columns.tolist()
-
-    print(
-        f"Loaded training schema with {len(feature_columns)} feature columns.")
-
-    print("Loading model from:", MODEL_PATH)
     model = joblib.load(MODEL_PATH)
 
-    # If the loaded model exposes booster feature names, prefer them as the canonical schema.
+    # Try to get feature names from booster (XGBoost)
+    model_feature_list = None
     try:
         booster = model.get_booster()
-        if booster.feature_names is not None:
-            # Make sure we return a python list of strings
-            feature_columns = list(booster.feature_names)
-            print(
-                f"Using booster.feature_names ({len(feature_columns)} features) as canonical schema.")
-        else:
-            # assign training schema to booster so booster can refer to them later
-            try:
-                booster.feature_names = feature_columns
-                print("Assigned training schema to booster.feature_names (best-effort).")
-            except Exception:
-                pass
+        if getattr(booster, "feature_names", None):
+            model_feature_list = list(booster.feature_names)
     except Exception:
-        # some models may not expose get_booster
-        print("Model does not support get_booster(); using training CSV schema.")
+        # some wrappers may not have get_booster; continue to fallback
+        model_feature_list = None
 
-    return model, feature_columns, training_df
+    # Fallback: try to read feature names file
+    if model_feature_list is None:
+        if os.path.exists(ALT_FEATURES_PATH):
+            with open(ALT_FEATURES_PATH, "r") as f:
+                model_feature_list = [line.strip() for line in f if line.strip()]
+        else:
+            # very last resort: try to read schema stored as json next to model
+            alt_json = os.path.splitext(MODEL_PATH)[0] + "_schema.json"
+            if os.path.exists(alt_json):
+                with open(alt_json, "r") as fj:
+                    model_feature_list = json.load(fj).get("feature_list")
+
+    if model_feature_list is None:
+        raise RuntimeError(
+            "Unable to determine model feature list. "
+            "Ensure the XGBoost model was saved with booster.feature_names set or "
+            "create ../models/feature_names.txt (one feature per line) or save schema JSON."
+        )
+
+    # remove any accidental target/timestamp if present
+    cleaned = [f for f in model_feature_list if f not in ("timestamp", "is_fraud")]
+    return model, cleaned

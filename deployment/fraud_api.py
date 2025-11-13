@@ -1,4 +1,4 @@
-# fraud_api.py
+# fraud_api.py (Option A production-ready)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pandas as pd
@@ -9,16 +9,19 @@ import os
 from model_loader import load_model_and_schema
 from feature_builder import build_features_from_raw, append_api_log, save_history_row, load_history
 
-# Load model + schema at startup
-model, MODEL_FEATURE_LIST, TRAINING_DF = load_model_and_schema()
+# Load model + schema
+model, MODEL_FEATURE_LIST = load_model_and_schema()
 
-app = FastAPI(title="Mobile Fraud Detection - Raw Input API")
+# Ensure we never include target/timestamp in schema
+MODEL_FEATURE_LIST = [
+    f for f in MODEL_FEATURE_LIST if f not in ("timestamp", "is_fraud")]
 
-# Create required directories
+app = FastAPI(title="Mobile Fraud Detection - Real-time (History-driven)")
+
+# ensure directories exist
 os.makedirs("../data/state", exist_ok=True)
 os.makedirs("../reports", exist_ok=True)
-
-# Pydantic schema for raw transaction (minimal)
+os.makedirs("../models", exist_ok=True)
 
 
 class RawTransaction(BaseModel):
@@ -26,7 +29,7 @@ class RawTransaction(BaseModel):
     user_id: int | None = None
     merchant_id: int | None = None
     amount: float
-    timestamp: str | None = None   # ISO string or parseable
+    timestamp: str | None = None
     transaction_type: str | None = "purchase"
     device_type: str | None = "Android"
     location: str | None = "Unknown"
@@ -34,68 +37,45 @@ class RawTransaction(BaseModel):
 
 @app.get("/")
 def root():
-    try:
-        feat_count = len(model.get_booster().feature_names)
-    except Exception:
-        feat_count = len(MODEL_FEATURE_LIST)
-        return {"status": "API Running Successfully 🚀", "model_features": feat_count, "log_file": "../reports/api_logs.csv"}
+    return {
+        "status": "API Running Successfully 🚀",
+        "model_features": len(MODEL_FEATURE_LIST),
+        "schema_preview": MODEL_FEATURE_LIST[:10]
+    }
 
 
 @app.post("/predict")
 def predict(txn: RawTransaction):
-
     try:
         raw = txn.dict()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Invalid input: {e}")
 
-    feature_vector, enriched_for_history = build_features_from_raw(
-        raw, MODEL_FEATURE_LIST, TRAINING_DF
-    )
+    # Build feature vector from history only
+    feature_vector, enriched = build_features_from_raw(raw, MODEL_FEATURE_LIST)
 
+    # Force numeric and fillna
     feature_vector = feature_vector.apply(
         pd.to_numeric, errors="coerce").fillna(0)
 
-    # Use model's actual feature names if available (most robust)
-    try:
-        model_feats = model.get_booster().feature_names
-        if model_feats is None:
-            # fallback to MODEL_FEATURE_LIST
-            model_feats = MODEL_FEATURE_LIST
-    except Exception:
-        model_feats = MODEL_FEATURE_LIST
-
-    # Align exactly to model features (order + count)
+    # Ensure exact ordering and presence
     feature_vector = feature_vector.reindex(
-        columns=list(model_feats), fill_value=0)
-    X_in = feature_vector
+        columns=MODEL_FEATURE_LIST, fill_value=0)
 
-    # ---------------- Robust prediction ----------------
+    # Convert to numpy for XGBoost
+    X_in = feature_vector.values
+
+    # Predict probability
     try:
-        proba_all = model.predict_proba(X_in)
-        # find index of positive class (1) if available
-        pos_idx = None
-        if hasattr(model, "classes_") and model.classes_ is not None:
-            try:
-                pos_idx = list(model.classes_).index(1)
-            except ValueError:
-                # class '1' not present; fallback to last column
-                pos_idx = proba_all.shape[1] - 1
-        else:
-            pos_idx = proba_all.shape[1] - 1
+        prob = float(model.predict_proba(X_in)[:, 1][0])
+    except Exception as e:
+        # provide a helpful log message
+        raise HTTPException(
+            status_code=500, detail=f"Model predict error: {e}")
 
-        prob = float(proba_all[:, pos_idx][0])
-    except Exception:
-        # last-resort try with numpy array input
-        proba_all = model.predict_proba(X_in.values)
-        pos_idx = proba_all.shape[1] - 1
-        prob = float(proba_all[:, pos_idx][0])
-    # ---------------------------------------------------
+    fraud_flag = bool(prob > 0.5)
 
-    # Use threshold 0.5 as before (you can tune later)
-    FRAUD_THRESHOLD = 0.10   # 10%
-    fraud_flag = bool(prob > FRAUD_THRESHOLD)
-
+    # Prepare API log
     log_entry = {
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "transaction_id": raw.get("transaction_id"),
@@ -106,16 +86,14 @@ def predict(txn: RawTransaction):
         "transaction_type": raw.get("transaction_type"),
         "location": raw.get("location"),
         "fraud_probability": round(prob, 4),
-        "fraud_flag": fraud_flag
+        "fraud_flag": int(fraud_flag)
     }
-
-    enriched_record = enriched_for_history.copy()
-    enriched_record.update({
-        "timestamp": datetime.datetime.utcnow().isoformat(),
-        "is_fraud": int(fraud_flag)
-    })
-
     append_api_log(log_entry)
-    save_history_row(enriched_record)
+
+    # Save enriched history (update is_fraud with predicted flag)
+    enriched["is_fraud"] = int(fraud_flag)
+    # timestamp: ensure ISO string (already provided by feature_builder) but override to now for consistent ordering
+    enriched["timestamp"] = datetime.datetime.utcnow().isoformat()
+    save_history_row(enriched)
 
     return {"fraud_probability": round(prob, 4), "fraud_flag": fraud_flag}
