@@ -34,7 +34,11 @@ class RawTransaction(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "API Running Successfully 🚀", "model_features": len(MODEL_FEATURE_LIST), "log_file": "../reports/api_logs.csv"}
+    try:
+        feat_count = len(model.get_booster().feature_names)
+    except Exception:
+        feat_count = len(MODEL_FEATURE_LIST)
+        return {"status": "API Running Successfully 🚀", "model_features": feat_count, "log_file": "../reports/api_logs.csv"}
 
 
 @app.post("/predict")
@@ -49,20 +53,46 @@ def predict(txn: RawTransaction):
         raw, MODEL_FEATURE_LIST, TRAINING_DF
     )
 
-    feature_vector = feature_vector.apply(pd.to_numeric, errors="coerce").fillna(0)
+    feature_vector = feature_vector.apply(
+        pd.to_numeric, errors="coerce").fillna(0)
 
-
-    model_features = model.get_booster().feature_names  # exact 53 features
-
-    feature_vector = feature_vector.reindex(columns=model_features, fill_value=0)
-    X_in = feature_vector
-    # ---------------------------------------------------------
-
+    # Use model's actual feature names if available (most robust)
     try:
-        prob = float(model.predict_proba(X_in)[:, 1][0])
-    except:
-        prob = float(model.predict_proba(X_in.values)[:, 1][0])
+        model_feats = model.get_booster().feature_names
+        if model_feats is None:
+            # fallback to MODEL_FEATURE_LIST
+            model_feats = MODEL_FEATURE_LIST
+    except Exception:
+        model_feats = MODEL_FEATURE_LIST
 
+    # Align exactly to model features (order + count)
+    feature_vector = feature_vector.reindex(
+        columns=list(model_feats), fill_value=0)
+    X_in = feature_vector
+
+    # ---------------- Robust prediction ----------------
+    try:
+        proba_all = model.predict_proba(X_in)
+        # find index of positive class (1) if available
+        pos_idx = None
+        if hasattr(model, "classes_") and model.classes_ is not None:
+            try:
+                pos_idx = list(model.classes_).index(1)
+            except ValueError:
+                # class '1' not present; fallback to last column
+                pos_idx = proba_all.shape[1] - 1
+        else:
+            pos_idx = proba_all.shape[1] - 1
+
+        prob = float(proba_all[:, pos_idx][0])
+    except Exception:
+        # last-resort try with numpy array input
+        proba_all = model.predict_proba(X_in.values)
+        pos_idx = proba_all.shape[1] - 1
+        prob = float(proba_all[:, pos_idx][0])
+    # ---------------------------------------------------
+
+    # Use threshold 0.5 as before (you can tune later)
     fraud_flag = bool(prob > 0.5)
 
     log_entry = {
