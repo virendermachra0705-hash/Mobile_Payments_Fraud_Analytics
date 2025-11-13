@@ -47,45 +47,37 @@ def predict(txn: RawTransaction):
 
     # Build features using history + training schema
     feature_vector, enriched_for_history = build_features_from_raw(
-        raw, MODEL_FEATURE_LIST, TRAINING_DF)
+        raw, MODEL_FEATURE_LIST, TRAINING_DF
+    )
 
-    # Align dtypes and ensure numeric
+    # Ensure numeric
     feature_vector = feature_vector.apply(
         pd.to_numeric, errors="coerce").fillna(0)
 
-    # Final alignment to model's feature names (safety)
-    try:
-        # If model has booster and feature_names, use them. Else use MODEL_FEATURE_LIST from training.
-        try:
-            booster = model.get_booster()
-            # assign booster.feature_names to model_feature_list if mismatch
-            if booster.feature_names is None or list(booster.feature_names) != MODEL_FEATURE_LIST:
-                booster.feature_names = MODEL_FEATURE_LIST
-        except Exception:
-            pass
-        drop_cols = ["timestamp", "is_fraud"]
-        for c in drop_cols:
-            if c in feature_vector.columns:
-                feature_vector = feature_vector.drop(columns=[c])
+    # ---------------------------------------------------------
+    # FIX FEATURE MISMATCH (Remove extra columns)
+    # ---------------------------------------------------------
+    extra_cols = ["timestamp", "is_fraud"]
+    for col in extra_cols:
+        if col in feature_vector.columns:
+            feature_vector.drop(columns=[col], inplace=True)
 
-        X_in = feature_vector[MODEL_FEATURE_LIST]
-    except Exception as e:
-        # fallback: ensure all columns present
-        for c in MODEL_FEATURE_LIST:
-            if c not in feature_vector.columns:
-                feature_vector[c] = 0
-        X_in = feature_vector[MODEL_FEATURE_LIST]
+    # Keep ONLY model-required columns (exact order)
+    feature_vector = feature_vector.reindex(
+        columns=MODEL_FEATURE_LIST, fill_value=0)
+
+    X_in = feature_vector  # now perfectly aligned
+    # ---------------------------------------------------------
 
     # Predict
     try:
         prob = float(model.predict_proba(X_in)[:, 1][0])
-    except Exception as e:
-        # Try converting to numpy array if model wrapper expects it
+    except:
         prob = float(model.predict_proba(X_in.values)[:, 1][0])
 
     fraud_flag = bool(prob > 0.5)
 
-    # Prepare log entry (flat)
+    # Prepare log entry
     log_entry = {
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "transaction_id": raw.get("transaction_id"),
@@ -96,21 +88,18 @@ def predict(txn: RawTransaction):
         "transaction_type": raw.get("transaction_type"),
         "location": raw.get("location"),
         "fraud_probability": round(prob, 4),
-        "fraud_flag": fraud_flag
+        "fraud_flag": fraud_flag,
     }
 
-    # Add enriched fields to history row (for full state)
+    # Full enriched record for history
     enriched_for_history_record = enriched_for_history.copy()
     enriched_for_history_record.update({
         "timestamp": datetime.datetime.utcnow().isoformat(),
-        # store predicted flag; if you have ground truth later, you can update
-        "is_fraud": int(fraud_flag)
+        "is_fraud": int(fraud_flag),
     })
 
-    # Append to logs and history
+    # Save logs + history
     append_api_log(log_entry)
-    # save full enriched record into history (so subsequent transactions see it)
     save_history_row(enriched_for_history_record)
 
-    # Return minimal response
     return {"fraud_probability": round(prob, 4), "fraud_flag": fraud_flag}
