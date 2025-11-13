@@ -1,86 +1,112 @@
-
-
-from fastapi import FastAPI
+# fraud_api.py
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
-import joblib
-import os
-import csv
 import datetime
-from preprocess_pipeline import preprocess_transaction
-from model_loader import load_model
+import os
 
-app = FastAPI(
-    title="Mobile Payment Fraud Detection API",
-    description="Real-time fraud scoring service for mobile payment transactions.",
-    version="1.3"
-)
+from model_loader import load_model_and_schema
+from feature_builder import build_features_from_raw, append_api_log, save_history_row, load_history
 
-model, booster = load_model("../models/xgboost_tuned.pkl")
-FEATURES = booster.feature_names
+# Load model + schema at startup
+model, MODEL_FEATURE_LIST, TRAINING_DF = load_model_and_schema()
 
-class Transaction(BaseModel):
-    amount: float = 0.0
-    hour: int = 0
-    day_of_week: str = "Monday"
-    device_type: str = "Android"
-    transaction_type: str = "purchase"
-    user_txn_count: float = 0.0
-    user_avg_amount: float = 0.0
-    user_std_amount: float = 0.0
-    rolling_fraud_rate_user_7d: float = 0.0
-    user_fraud_rate: float = 0.0
-    amount_zscore_user: float = 0.0
-    merchant_fraud_rate: float = 0.0
-    peer_spend_ratio: float = 0.0
-    weighted_amount: float = 0.0
+app = FastAPI(title="Mobile Fraud Detection - Raw Input API")
+
+# Create required directories
+os.makedirs("../data/state", exist_ok=True)
+os.makedirs("../reports", exist_ok=True)
+
+# Pydantic schema for raw transaction (minimal)
+
+
+class RawTransaction(BaseModel):
+    transaction_id: str | None = None
+    user_id: int | None = None
+    merchant_id: int | None = None
+    amount: float
+    timestamp: str | None = None   # ISO string or parseable
+    transaction_type: str | None = "purchase"
+    device_type: str | None = "Android"
+    location: str | None = "Unknown"
+
 
 @app.get("/")
-def home():
-    return {
-        "status": "API Running Successfully 🚀",
-        "model_features": len(FEATURES),
-        "log_file": "../reports/api_logs.csv"
-    }
+def root():
+    return {"status": "API Running Successfully 🚀", "model_features": len(MODEL_FEATURE_LIST), "log_file": "../reports/api_logs.csv"}
+
 
 @app.post("/predict")
-def predict(txn: Transaction):
-    txn_dict = txn.dict()
+def predict(txn: RawTransaction):
+    # Validate minimal fields
+    try:
+        raw = txn.dict()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    # --- Step 1: Preprocess Input ---
-    data = preprocess_transaction(txn_dict, FEATURES)
+    # Build features using history + training schema
+    feature_vector, enriched_for_history = build_features_from_raw(
+        raw, MODEL_FEATURE_LIST, TRAINING_DF)
 
-    # --- Step 2: Model Inference ---
-    prob = model.predict_proba(data)[:, 1][0]
+    # Align dtypes and ensure numeric
+    feature_vector = feature_vector.apply(
+        pd.to_numeric, errors="coerce").fillna(0)
+
+    # Final alignment to model's feature names (safety)
+    try:
+        # If model has booster and feature_names, use them. Else use MODEL_FEATURE_LIST from training.
+        try:
+            booster = model.get_booster()
+            # assign booster.feature_names to model_feature_list if mismatch
+            if booster.feature_names is None or list(booster.feature_names) != MODEL_FEATURE_LIST:
+                booster.feature_names = MODEL_FEATURE_LIST
+        except Exception:
+            pass
+
+        X_in = feature_vector[MODEL_FEATURE_LIST]
+    except Exception as e:
+        # fallback: ensure all columns present
+        for c in MODEL_FEATURE_LIST:
+            if c not in feature_vector.columns:
+                feature_vector[c] = 0
+        X_in = feature_vector[MODEL_FEATURE_LIST]
+
+    # Predict
+    try:
+        prob = float(model.predict_proba(X_in)[:, 1][0])
+    except Exception as e:
+        # Try converting to numpy array if model wrapper expects it
+        prob = float(model.predict_proba(X_in.values)[:, 1][0])
+
     fraud_flag = bool(prob > 0.5)
 
-    # --- Step 3: Logging ---
+    # Prepare log entry (flat)
     log_entry = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        **txn_dict,
-        "fraud_probability": round(float(prob), 4),
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "transaction_id": raw.get("transaction_id"),
+        "user_id": raw.get("user_id"),
+        "merchant_id": raw.get("merchant_id"),
+        "amount": raw.get("amount"),
+        "device_type": raw.get("device_type"),
+        "transaction_type": raw.get("transaction_type"),
+        "location": raw.get("location"),
+        "fraud_probability": round(prob, 4),
         "fraud_flag": fraud_flag
     }
 
-    log_dir = "../reports"
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "api_logs.csv")
+    # Add enriched fields to history row (for full state)
+    enriched_for_history_record = enriched_for_history.copy()
+    enriched_for_history_record.update({
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        # store predicted flag; if you have ground truth later, you can update
+        "is_fraud": int(fraud_flag)
+    })
 
-    file_exists = os.path.exists(log_path)
-    with open(log_path, mode="a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=log_entry.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(log_entry)
+    # Append to logs and history
+    append_api_log(log_entry)
+    # save full enriched record into history (so subsequent transactions see it)
+    save_history_row(enriched_for_history_record)
 
-    # --- Step 4: Response ---
-    return {
-        "fraud_probability": round(float(prob), 4),
-        "fraud_flag": fraud_flag,
-        "message": "Prediction logged successfully ✅"
-    }
-
-@app.get("/health")
-def health():
-    return {"status": "Healthy", "timestamp": datetime.datetime.now().isoformat()}
+    # Return minimal response
+    return {"fraud_probability": round(prob, 4), "fraud_flag": fraud_flag}
