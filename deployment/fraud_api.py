@@ -93,7 +93,8 @@ def predict(txn: RawTransaction):
     # ---------------------------------------------------
 
     # Use threshold 0.5 as before (you can tune later)
-    fraud_flag = bool(prob > 0.5)
+    FRAUD_THRESHOLD = 0.10   # 10%
+    fraud_flag = bool(prob > FRAUD_THRESHOLD)
 
     log_entry = {
         "timestamp": datetime.datetime.utcnow().isoformat(),
