@@ -104,7 +104,7 @@ def predict(txn: RawTransaction):
         raise HTTPException(
             status_code=500, detail=f"Model prediction Error: {e}")
 
-    fraud_flag = bool(prob > 0.5)
+    fraud_flag = bool(prob > 0.3)
 
     # -----------------
     # LOGGING + HISTORY
@@ -132,4 +132,21 @@ def predict(txn: RawTransaction):
     return {
         "fraud_probability": round(prob, 4),
         "fraud_flag": fraud_flag
+    }
+
+
+@app.post("/debug")
+def debug(txn: RawTransaction):
+    raw = txn.dict()
+
+    feature_vector, enriched = build_features_from_raw(
+        raw, MODEL_FEATURE_LIST, TRAINING_DF
+    )
+
+    prob = float(model.predict_proba(feature_vector.values)[:, 1][0])
+
+    return {
+        "probability": prob,
+        "top_features": feature_vector.iloc[0].sort_values(ascending=False).head(15).to_dict(),
+        "all_features": enriched
     }
