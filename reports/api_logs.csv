@@ -1,4 +1,0 @@
-timestamp,amount,hour,day_of_week,device_type,transaction_type,user_txn_count,user_avg_amount,user_std_amount,rolling_fraud_rate_user_7d,user_fraud_rate,amount_zscore_user,merchant_fraud_rate,peer_spend_ratio,weighted_amount,fraud_probability,fraud_flag
-2025-11-12T23:04:48.243723,500.5,18,monday,ios,transfer,25.0,800.0,200.0,0.4,0.2,1.8,0.1,1.5,2100.0,0.9808,True
-2025-11-12T23:05:00.802516,500.5,18,monday,ios,transfer,25.0,800.0,200.0,0.1,0.2,1.8,0.1,1.5,2100.0,0.9552,True
-2025-11-12T23:06:10.447556,350.75,14,Tuesday,Android,purchase,120.0,400.0,80.0,0.02,0.01,0.3,0.01,0.95,360.0,0.0027,False
