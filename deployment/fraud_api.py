@@ -5,28 +5,35 @@ import pandas as pd
 import numpy as np
 import datetime
 import os
+import traceback
 
 from model_loader import load_model_and_schema
-from feature_builder import (
-    build_features_from_raw,
-    append_api_log,
-    save_history_row,
-    load_history
-)
+from feature_builder import build_features_from_raw, append_api_log, save_history_row, load_history
 
-# Load model, schema, training_df
-model, MODEL_FEATURE_LIST, TRAINING_DF = load_model_and_schema()
+# Load model + schema at startup. Support both return shapes (2-tuple or 3-tuple)
+try:
+    res = load_model_and_schema()
+    if isinstance(res, tuple) and len(res) == 3:
+        model, MODEL_FEATURE_LIST, TRAINING_DF = res
+    elif isinstance(res, tuple) and len(res) == 2:
+        model, MODEL_FEATURE_LIST = res
+        TRAINING_DF = None
+    else:
+        raise RuntimeError("load_model_and_schema returned unexpected shape")
+except Exception as e:
+    # fail-fast on startup
+    raise
 
 app = FastAPI(title="Mobile Fraud Detection - Raw Input API")
 
-# Ensure directories exist
+# Create required directories
 os.makedirs("../data/state", exist_ok=True)
 os.makedirs("../reports", exist_ok=True)
 
+# Threshold: tune per business (default 3%)
+THRESHOLD = float(os.environ.get("FRAUD_THRESHOLD", 0.03))
 
-# ---------------------------
-#  INPUT SCHEMA
-# ---------------------------
+
 class RawTransaction(BaseModel):
     transaction_id: str | None = None
     user_id: int | None = None
@@ -38,115 +45,114 @@ class RawTransaction(BaseModel):
     location: str | None = "Unknown"
 
 
-# ---------------------------
-#  ROOT ENDPOINT
-# ---------------------------
 @app.get("/")
 def root():
-    return {
-        "status": "API Running Successfully 🚀",
-        "model_features": len(MODEL_FEATURE_LIST),
-        "schema_endpoint": "/schema"
-    }
+    return {"status": "API Running Successfully 🚀", "model_features": len(MODEL_FEATURE_LIST), "log_file": "../reports/api_logs.csv"}
 
 
-# ---------------------------
-#  FEATURE SCHEMA PREVIEW
-# ---------------------------
 @app.get("/schema")
-def get_schema():
-    return {
-        "feature_count": len(MODEL_FEATURE_LIST),
-        "features": MODEL_FEATURE_LIST
-    }
+def schema():
+    return {"feature_count": len(MODEL_FEATURE_LIST), "features": MODEL_FEATURE_LIST}
 
 
-# ---------------------------
-#  PREDICTION ENDPOINT
-# ---------------------------
 @app.post("/predict")
 def predict(txn: RawTransaction):
-
-    # convert input to dict
     try:
         raw = txn.dict()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid input: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
-    # Build features (safe + stable)
     try:
-        feature_vector, enriched_for_history = build_features_from_raw(
-            raw, MODEL_FEATURE_LIST
-        )
+        feature_vector, enriched_for_history = build_features_from_raw(raw, MODEL_FEATURE_LIST, TRAINING_DF)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Feature error: {e}")
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=422, detail=f"Feature error: {str(e)}\n{tb}")
 
-    # Convert to numeric (ensure no dtype issues)
-    feature_vector = feature_vector.apply(
-        pd.to_numeric, errors="coerce").fillna(0)
+    # numeric alignment
+    feature_vector = feature_vector.apply(pd.to_numeric, errors="coerce").fillna(0)
 
-    # Ensure correct shape
+    # Make sure columns strictly match model feature list
+    for c in MODEL_FEATURE_LIST:
+        if c not in feature_vector.columns:
+            feature_vector[c] = 0
+    feature_vector = feature_vector[MODEL_FEATURE_LIST]
+
+    # Predict
     try:
-        X_in = feature_vector[MODEL_FEATURE_LIST]
+        # model.predict_proba may accept dataframe or numpy
+        probs = model.predict_proba(feature_vector)[:, 1]
     except Exception:
-        # fallback fill for missing columns
-        for feat in MODEL_FEATURE_LIST:
-            if feat not in feature_vector.columns:
-                feature_vector[feat] = 0
-        X_in = feature_vector[MODEL_FEATURE_LIST]
+        probs = model.predict_proba(feature_vector.values)[:, 1]
 
-    # -----------------
-    # MODEL PREDICTION
-    # -----------------
-    try:
-        prob = float(model.predict_proba(X_in.values)[:, 1][0])
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Model prediction Error: {e}")
+    prob = float(probs[0])
+    fraud_flag = bool(prob >= THRESHOLD)
 
-    fraud_flag = bool(prob > 0.3)
-
-    # -----------------
-    # LOGGING + HISTORY
-    # -----------------
+    # Prepare log entry
     log_entry = {
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "transaction_id": raw.get("transaction_id"),
         "user_id": raw.get("user_id"),
         "merchant_id": raw.get("merchant_id"),
         "amount": raw.get("amount"),
-        "transaction_type": raw.get("transaction_type"),
         "device_type": raw.get("device_type"),
+        "transaction_type": raw.get("transaction_type"),
         "location": raw.get("location"),
-        "fraud_probability": round(prob, 4),
+        "fraud_probability": round(prob, 6),
         "fraud_flag": fraud_flag
     }
 
-    # enriched state row (store predicted flag)
-    enriched_for_history["timestamp"] = datetime.datetime.utcnow().isoformat()
-    enriched_for_history["is_fraud"] = int(fraud_flag)
+    # Save enriched history row (append predicted flag)
+    enriched_record = enriched_for_history.copy()
+    enriched_record.update({
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "is_fraud": int(fraud_flag)
+    })
 
-    append_api_log(log_entry)
-    save_history_row(enriched_for_history)
+    try:
+        append_api_log(log_entry)
+        save_history_row(enriched_record)
+    except Exception:
+        # don't fail prediction if logging fails
+        pass
 
-    return {
-        "fraud_probability": round(prob, 4),
-        "fraud_flag": fraud_flag
-    }
+    return {"fraud_probability": round(prob, 6), "fraud_flag": fraud_flag}
 
 
 @app.post("/debug")
 def debug(txn: RawTransaction):
-    raw = txn.dict()
+    """
+    Return feature vector and model probability for one transaction for debugging.
+    DO NOT expose this in public production without auth.
+    """
+    try:
+        raw = txn.dict()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    feature_vector, enriched = build_features_from_raw(
-        raw, MODEL_FEATURE_LIST, TRAINING_DF
-    )
+    try:
+        feature_vector, enriched_for_history = build_features_from_raw(raw, MODEL_FEATURE_LIST, TRAINING_DF)
+        feature_vector = feature_vector.apply(pd.to_numeric, errors="coerce").fillna(0)
+        for c in MODEL_FEATURE_LIST:
+            if c not in feature_vector.columns:
+                feature_vector[c] = 0
+        feature_vector = feature_vector[MODEL_FEATURE_LIST]
+    except Exception as e:
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=422, detail=f"Feature error: {str(e)}\n{tb}")
 
-    prob = float(model.predict_proba(feature_vector.values)[:, 1][0])
+    try:
+        probs = model.predict_proba(feature_vector)[:, 1]
+    except Exception:
+        probs = model.predict_proba(feature_vector.values)[:, 1]
+
+    prob = float(probs[0])
+    top_feats = feature_vector.iloc[0].sort_values(ascending=False).head(30).to_dict()
 
     return {
         "probability": prob,
-        "top_features": feature_vector.iloc[0].sort_values(ascending=False).head(15).to_dict(),
-        "all_features": enriched
+        "threshold": THRESHOLD,
+        "fraud_flag": bool(prob >= THRESHOLD),
+        "top_features": top_feats,
+        "feature_vector": feature_vector.iloc[0].to_dict(),
+        "enriched_for_history": enriched_for_history
     }

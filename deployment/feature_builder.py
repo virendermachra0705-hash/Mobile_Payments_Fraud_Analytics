@@ -1,20 +1,13 @@
 # feature_builder.py
-"""
-Production feature builder that mirrors notebook feature engineering.
-- Uses history at ../data/state/transactions_history.csv (append-only)
-- Uses training summary from ../data/processed/features_enriched_v2.csv
-- Returns (feature_vector_df, enriched_record_dict)
-- Writes last feature vector to ../reports/last_feature_vector.csv for debugging
-"""
-import os
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime, timedelta
 
 HISTORY_PATH = "../data/state/transactions_history.csv"
-TRAINING_PATH = "../data/processed/features_enriched_v2.csv"
 API_LOG_PATH = "../reports/api_logs.csv"
-LAST_FEATURE_PATH = "../reports/last_feature_vector.csv"
+
+# Helper: safe parse timestamp -> pandas Timestamp
 
 
 def _safe_datetime(ts):
@@ -23,195 +16,156 @@ def _safe_datetime(ts):
     except Exception:
         return pd.to_datetime(str(ts), errors="coerce")
 
+# Load persistent history used for rolling/stateful features
+
 
 def load_history():
     if os.path.exists(HISTORY_PATH):
         try:
-            return pd.read_csv(HISTORY_PATH, parse_dates=["timestamp"])
+            hist = pd.read_csv(HISTORY_PATH, parse_dates=["timestamp"])
+            # Ensure minimal expected columns exist (avoid KeyError later)
+            expected = ["transaction_id", "user_id", "merchant_id", "amount", "timestamp",
+                        "device_type", "transaction_type", "location", "is_fraud",
+                        "user_txn_count", "user_avg_amount", "user_std_amount",
+                        "merchant_fraud_rate", "txn_count_24h", "txn_count_1h", "rolling_fraud_rate_user_7d"]
+            for c in expected:
+                if c not in hist.columns:
+                    hist[c] = np.nan
+            return hist
         except Exception:
-            # fallback if file corrupt
-            return pd.DataFrame()
+            return pd.DataFrame(columns=["transaction_id", "user_id", "merchant_id", "amount", "timestamp",
+                                         "device_type", "transaction_type", "location", "is_fraud"])
     else:
-        return pd.DataFrame()
-
-
-def load_training_df():
-    if os.path.exists(TRAINING_PATH):
-        try:
-            return pd.read_csv(TRAINING_PATH)
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
+        cols = ["transaction_id", "user_id", "merchant_id", "amount", "timestamp",
+                "device_type", "transaction_type", "location", "is_fraud"]
+        return pd.DataFrame(columns=cols)
 
 
 def save_history_row(enriched_txn):
     os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
-    write_header = not os.path.exists(HISTORY_PATH)
-    # ensure timestamp is string
-    row = enriched_txn.copy()
-    if "timestamp" in row and not isinstance(row["timestamp"], str):
-        row["timestamp"] = pd.to_datetime(row["timestamp"]).isoformat()
     import csv
-    with open(HISTORY_PATH, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
-        if write_header:
+    file_exists = os.path.exists(HISTORY_PATH)
+    with open(HISTORY_PATH, mode="a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(enriched_txn.keys()))
+        if not file_exists:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow(enriched_txn)
 
 
 def append_api_log(log_entry):
     os.makedirs(os.path.dirname(API_LOG_PATH), exist_ok=True)
-    write_header = not os.path.exists(API_LOG_PATH)
     import csv
-    with open(API_LOG_PATH, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=log_entry.keys())
-        if write_header:
+    file_exists = os.path.exists(API_LOG_PATH)
+    with open(API_LOG_PATH, mode="a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(log_entry.keys()))
+        if not file_exists:
             writer.writeheader()
         writer.writerow(log_entry)
 
-
-def _write_last_feature_vector(df):
-    os.makedirs(os.path.dirname(LAST_FEATURE_PATH), exist_ok=True)
-    df.to_csv(LAST_FEATURE_PATH, index=False)
+# Core: build feature vector for a single raw txn
 
 
-def build_features_from_raw(raw_txn: dict, model_feature_list: list):
+def build_features_from_raw(raw_txn: dict, model_feature_list: list, training_df: pd.DataFrame = None):
     """
-    Build features according to notebook logic and align with model_feature_list.
-    Returns (feature_vector_df, enriched_record_dict)
+    raw_txn: dict with transaction fields
+    model_feature_list: ordered list of feature column names expected by model
+    training_df: DataFrame used as fallback medians/defaults (can be None)
+    Returns:
+       feature_vector (pd.DataFrame, single row, columns == model_feature_list)
+       enriched_for_history (dict)   # for saving into history CSV
     """
-    # load history and training
+
+    # load persistent history
     hist = load_history()
-    training_df = load_training_df()
 
-    # normalize input
+    # Normalize raw txn
     txn = raw_txn.copy()
     txn_ts = _safe_datetime(txn.get("timestamp", pd.Timestamp.utcnow()))
     if pd.isna(txn_ts):
         txn_ts = pd.Timestamp.utcnow()
     txn["timestamp"] = txn_ts
 
-    # ensure keys
-    transaction_id = txn.get("transaction_id")
+    # Ensure keys
+    for k in ["transaction_id", "user_id", "merchant_id", "amount", "device_type", "transaction_type", "location"]:
+        if k not in txn:
+            txn[k] = None
+
+    # Force numeric amount
+    try:
+        txn["amount"] = float(txn["amount"])
+    except Exception:
+        txn["amount"] = 0.0
+
+    # Basic temporals
+    hour = int(txn["timestamp"].hour)
+    day_of_week = txn["timestamp"].day_name()
+    is_weekend = 1 if day_of_week in ["Saturday", "Sunday"] else 0
+
     user_id = txn.get("user_id")
     merchant_id = txn.get("merchant_id")
-    try:
-        amount = float(txn.get("amount", 0.0))
-    except Exception:
-        amount = 0.0
     device_type = txn.get("device_type", "Unknown")
     transaction_type = txn.get("transaction_type", "purchase")
     location = txn.get("location", "Unknown")
 
-    # training-derived thresholds / medians
-    def _median(col, default=0.0):
-        if col in training_df.columns and not training_df[col].isna().all():
-            try:
+    # Prepare training medians/fallbacks
+    def median_or_default(col, default=0.0):
+        try:
+            if training_df is not None and col in training_df.columns:
                 return float(training_df[col].median())
-            except Exception:
-                return default
+        except Exception:
+            pass
         return default
 
-    median_amount = _median("amount", 1.0)
-    median_txn_velocity = _median("txn_velocity", 0.0)
-    median_device_risk = _median("device_risk_score", 0.0)
-    median_location_risk = _median("location_risk_score", 0.0)
-    median_user_avg_amount = _median("user_avg_amount", median_amount)
+    median_user_avg = median_or_default("user_avg_amount", 0.0)
+    median_user_std = median_or_default("user_std_amount", 1.0)
+    median_merchant_fraud = median_or_default("merchant_fraud_rate", 0.0)
+    median_amount = median_or_default("amount", 0.0)
 
-    # historical slices (exclude current)
-    if not hist.empty and "user_id" in hist.columns and pd.notna(user_id):
+    # User-level history
+    if (user_id is not None) and ("user_id" in hist.columns) and (user_id in hist["user_id"].values):
         user_hist = hist[hist["user_id"] == user_id].sort_values("timestamp")
     else:
         user_hist = pd.DataFrame()
 
-    # user aggregates
     user_txn_count = int(user_hist.shape[0]) if not user_hist.empty else 0
-    user_txn_sum = float(user_hist["amount"].sum()) if (
-        not user_hist.empty and "amount" in user_hist.columns) else 0.0
-    user_avg_amount = float(user_hist["amount"].mean()) if (
-        not user_hist.empty and user_hist["amount"].notna().any()) else median_user_avg_amount
-    # STD fallback: if std=0 or NaN, use training median user_std_amount or 1
-    if not user_hist.empty and user_hist["amount"].std() == user_hist["amount"].std():
-        user_std_amount = float(user_hist["amount"].std())
-        if user_std_amount == 0:
-            user_std_amount = _median("user_std_amount", 1.0)
+    if user_txn_count > 0:
+        user_txn_sum = float(user_hist["amount"].sum())
+        user_avg_amount = float(user_hist["amount"].mean())
+        user_std_amount = float(user_hist["amount"].std()) if pd.notna(
+            user_hist["amount"].std()) and user_hist["amount"].std() != 0 else median_user_std
     else:
-        user_std_amount = _median("user_std_amount", 1.0)
-    if user_std_amount == 0:
-        user_std_amount = 1.0
+        user_txn_sum = 0.0
+        user_avg_amount = median_user_avg
+        user_std_amount = median_user_std
 
-    # amount zscore
-    amount_zscore_user = (amount - user_avg_amount) / \
-        (user_std_amount if user_std_amount else 1.0)
+    # amount zscore relative to user's distribution (fallback to global medians)
+    if user_txn_count >= 2 and user_std_amount > 0:
+        amount_zscore_user = (
+            txn["amount"] - user_avg_amount) / user_std_amount
+    else:
+        global_std = median_or_default("user_std_amount", 1.0)
+        global_avg = median_or_default("user_avg_amount", median_user_avg)
+        amount_zscore_user = (txn["amount"] - global_avg) / \
+            (global_std if global_std != 0 else 1.0)
 
-    # time diff since last user txn (seconds)
-    time_diff_sec = 0.0
-    if not user_hist.empty and "timestamp" in user_hist.columns:
+    # Time diff since last txn for this user (seconds)
+    if not user_hist.empty:
+        # ensure timestamp type
+        last_ts = user_hist["timestamp"].max()
         try:
-            last_ts = pd.to_datetime(user_hist["timestamp"]).max()
-            time_diff_sec = (pd.to_datetime(txn_ts) -
-                             pd.to_datetime(last_ts)).total_seconds()
+            last_ts = pd.to_datetime(last_ts)
+            time_diff_sec = (txn_ts - last_ts).total_seconds()
             if pd.isna(time_diff_sec):
                 time_diff_sec = 0.0
         except Exception:
             time_diff_sec = 0.0
     else:
-        # fallback large value (user has no history)
-        time_diff_sec = 999999.0
+        time_diff_sec = np.nan
 
-    # time_diff in minutes
-    time_diff = time_diff_sec / 60.0
-
-    # txn velocity = 1/(time_diff+1)
-    txn_velocity = 1.0 / (time_diff_sec + 1.0)
-
-    # merchant-level aggregates
-    if not hist.empty and "merchant_id" in hist.columns and pd.notna(merchant_id) and merchant_id in hist["merchant_id"].values:
-        merchant_hist = hist[hist["merchant_id"] == merchant_id]
-        merchant_txn_count = int(merchant_hist.shape[0])
-        merchant_unique_users = int(merchant_hist["user_id"].nunique(
-        )) if "user_id" in merchant_hist.columns else 0
-        merchant_fraud_rate = float(merchant_hist["is_fraud"].mean(
-        )) if "is_fraud" in merchant_hist.columns else _median("merchant_fraud_rate", 0.0)
-    else:
-        merchant_txn_count = 0
-        merchant_unique_users = 0
-        merchant_fraud_rate = _median("merchant_fraud_rate", 0.0)
-
-    # merchant_user_overlap
-    if merchant_txn_count > 0:
-        merchant_user_overlap = merchant_unique_users / merchant_txn_count
-    else:
-        merchant_user_overlap = 0.0
-
-    # device and location risk from history (device_type/location may be missing in hist)
-    if not hist.empty and "device_type" in hist.columns:
-        device_txn_count = int(
-            hist[hist["device_type"] == device_type].shape[0])
-        device_risk_score = float(hist[hist["device_type"] == device_type]["is_fraud"].mean(
-        )) if device_txn_count > 0 and "is_fraud" in hist.columns else _median("device_risk_score", 0.0)
-    else:
-        device_txn_count = 0
-        device_risk_score = _median("device_risk_score", 0.0)
-
-    if not hist.empty and "location" in hist.columns:
-        location_txn_count = int(hist[hist["location"] == location].shape[0])
-        location_risk_score = float(hist[hist["location"] == location]["is_fraud"].mean(
-        )) if location_txn_count > 0 and "is_fraud" in hist.columns else _median("location_risk_score", 0.0)
-    else:
-        location_txn_count = 0
-        location_risk_score = _median("location_risk_score", 0.0)
-
-    # location_device_interaction
-    location_device_interaction = device_risk_score * location_risk_score
-
-    # rolling counts (use history timestamps)
-    if not user_hist.empty and "timestamp" in user_hist.columns:
-        # create series of timestamps (exclude current)
-        hist_ts = pd.to_datetime(user_hist["timestamp"])
-        # count txns in last 1H and 24H relative to txn_ts
-        one_h_ago = pd.to_datetime(txn_ts) - pd.Timedelta(hours=1)
-        day_ago = pd.to_datetime(txn_ts) - pd.Timedelta(hours=24)
+    # Rolling counts for velocity
+    if not user_hist.empty:
+        one_h_ago = txn_ts - pd.Timedelta(hours=1)
+        day_ago = txn_ts - pd.Timedelta(hours=24)
         txn_count_1h = int(
             user_hist[user_hist["timestamp"] >= one_h_ago].shape[0])
         txn_count_24h = int(
@@ -220,98 +174,138 @@ def build_features_from_raw(raw_txn: dict, model_feature_list: list):
         txn_count_1h = 0
         txn_count_24h = 0
 
-    # is_high_amount, is_new_user, is_high_velocity thresholds from training
-    is_high_amount = 1 if amount > (
-        3 * user_avg_amount if user_avg_amount > 0 else 3 * median_amount) else 0
-    is_new_user = 1 if user_txn_count < 5 else 0
-
-    # threshold for high velocity: use training 95th percentile of txn_velocity
-    try:
-        velocity_thr = float(training_df["txn_velocity"].quantile(
-            0.95)) if "txn_velocity" in training_df.columns else (median_txn_velocity + 1e-6)
-    except Exception:
-        velocity_thr = median_txn_velocity + 1e-6
-    is_high_velocity = 1 if txn_velocity > velocity_thr else 0
-
-    # is_risky_device / is_risky_location thresholds from training 90th quantile
-    try:
-        device_thr = float(training_df["device_risk_score"].quantile(
-            0.9)) if "device_risk_score" in training_df.columns else median_device_risk
-    except Exception:
-        device_thr = median_device_risk
-    try:
-        location_thr = float(training_df["location_risk_score"].quantile(
-            0.9)) if "location_risk_score" in training_df.columns else median_location_risk
-    except Exception:
-        location_thr = median_location_risk
-    is_risky_device = 1 if device_risk_score > device_thr else 0
-    is_risky_location = 1 if location_risk_score > location_thr else 0
-
-    # weighted amount and user risk score
-    weighted_amount = amount * device_risk_score * location_risk_score
-    user_risk_score = float((device_risk_score + location_risk_score) / 2.0)
-
-    # rolling fraud rate user 7d (exclude current)
-    if not user_hist.empty and "timestamp" in user_hist.columns and "is_fraud" in user_hist.columns:
-        recent = user_hist[pd.to_datetime(user_hist["timestamp"]) >= (
-            pd.to_datetime(txn_ts) - pd.Timedelta(days=7))]
-        rolling_fraud_rate_user_7d = float(
-            recent["is_fraud"].mean()) if not recent.empty else 0.0
-    else:
-        rolling_fraud_rate_user_7d = 0.0
-
-    # user historical fraud rate (exclude current)
+    txn_order = user_txn_count
+    rolling_fraud_rate_user_7d = 0.0
+    if not user_hist.empty and "is_fraud" in user_hist.columns:
+        seven_days_ago = txn_ts - pd.Timedelta(days=7)
+        recent = user_hist[user_hist["timestamp"] >= seven_days_ago]
+        if recent.shape[0] > 0:
+            rolling_fraud_rate_user_7d = float(recent["is_fraud"].mean())
     user_fraud_rate = float(user_hist["is_fraud"].mean()) if (
         not user_hist.empty and "is_fraud" in user_hist.columns) else 0.0
 
-    # txns_in_last_5min (history)
-    if not user_hist.empty and "timestamp" in user_hist.columns:
-        window_5m = pd.to_datetime(txn_ts) - pd.Timedelta(minutes=5)
-        txns_in_last_5min = int(user_hist[pd.to_datetime(
-            user_hist["timestamp"]) >= window_5m].shape[0])
+    # merchant-based stats
+    if (merchant_id is not None) and ("merchant_id" in hist.columns) and (merchant_id in hist["merchant_id"].values):
+        merchant_hist = hist[hist["merchant_id"] == merchant_id]
+        merchant_txn_count = int(merchant_hist.shape[0])
+        merchant_unique_users = int(merchant_hist["user_id"].nunique(
+        )) if "user_id" in merchant_hist.columns else 0
+        merchant_fraud_rate = float(merchant_hist["is_fraud"].mean(
+        )) if "is_fraud" in merchant_hist.columns else median_merchant_fraud
+        merchant_past_fraud_rate = merchant_fraud_rate
+    else:
+        merchant_txn_count = 0
+        merchant_unique_users = 0
+        merchant_fraud_rate = median_merchant_fraud
+        merchant_past_fraud_rate = median_merchant_fraud
+
+    # merchant_user_overlap (unique users / total txns)
+    merchant_user_overlap = merchant_unique_users / (merchant_txn_count + 1)
+
+    # device & location heuristics
+    if ("device_type" in hist.columns) and (device_type in hist["device_type"].values):
+        device_risk_score = float(hist[hist["device_type"] == device_type]["is_fraud"].mean(
+        )) if "is_fraud" in hist.columns else 0.0
+        device_txn_count = int(
+            hist[hist["device_type"] == device_type].shape[0])
+    else:
+        device_risk_score = 0.0
+        device_txn_count = 0
+
+    if ("location" in hist.columns) and (location in hist["location"].values):
+        location_risk_score = float(hist[hist["location"] == location]["is_fraud"].mean(
+        )) if "is_fraud" in hist.columns else 0.0
+        location_txn_count = int(hist[hist["location"] == location].shape[0])
+    else:
+        location_risk_score = 0.0
+        location_txn_count = 0
+
+    device_location_interaction = int(hist[(hist.get("device_type") == device_type) & (
+        hist.get("location") == location)].shape[0]) if not hist.empty else 0
+
+    # txns in last 5 min
+    txns_in_last_5min = 0
+    if not user_hist.empty:
+        window_5m = txn_ts - pd.Timedelta(minutes=5)
+        txns_in_last_5min = int(
+            user_hist[user_hist["timestamp"] >= window_5m].shape[0])
     else:
         txns_in_last_5min = 0
 
-    # avg_time_gap_prev3 from history (seconds)
-    avg_time_gap_prev3 = 0.0
-    if not user_hist.empty and "timestamp" in user_hist.columns:
-        ts = pd.to_datetime(user_hist["timestamp"]).sort_values()
-        if len(ts) >= 2:
-            gaps = ts.diff().dt.total_seconds().dropna()
-            avg_time_gap_prev3 = float(gaps.tail(3).mean()) if not gaps.tail(
-                3).empty else float(gaps.mean())
-        else:
-            avg_time_gap_prev3 = float(_median("time_diff_sec", 0.0))
+    # velocity and related
+    time_diff = time_diff_sec if not pd.isna(time_diff_sec) else 99999.0
+    txn_velocity = (txn_count_24h / 24.0) if txn_count_24h > 0 else 0.0
 
-    # peer_spend_ratio: amount / user median (use training fallback)
-    try:
-        user_median_amount = float(user_hist["amount"].median()) if (
-            not user_hist.empty and "amount" in user_hist.columns) else _median("amount", median_amount)
-    except Exception:
-        user_median_amount = median_amount
-    peer_spend_ratio = amount / \
-        (user_median_amount if user_median_amount != 0 else 1.0)
+    # boolean/rule flags
+    is_night = 1 if hour in [0, 1, 2, 3, 4, 5] else 0
+    is_new_user = 1 if user_txn_count == 0 else 0
+    is_high_amount = 1 if txn["amount"] > (
+        user_avg_amount * 3 if user_avg_amount > 0 else median_amount) else 0
+    is_high_velocity = 1 if txn_count_1h >= 5 else 0
+    is_risky_device = 1 if device_risk_score > 0.0 else 0
+    is_risky_location = 1 if location_risk_score > 0.0 else 0
 
-    # recent_txn_weight and txn_order
-    txn_order = int(user_txn_count)
-    recent_txn_weight = float(np.exp(-0.01 * txn_order))
+    # weighted amount
+    weighted_amount = txn["amount"] * (1 + merchant_fraud_rate)
 
-    # device_location_ratio
-    device_location_ratio = device_txn_count / \
-        (location_txn_count + 1) if (location_txn_count + 1) > 0 else 0.0
+    # recent_txn_weight (decay)
+    recent_txn_weight = 1.0 / (1 + txn_order)
 
-    # user_device_count and user_location_count
+    # user_device_count & user_location_count
     user_device_count = int(user_hist["device_type"].nunique()) if (
         not user_hist.empty and "device_type" in user_hist.columns) else 0
     user_location_count = int(user_hist["location"].nunique()) if (
         not user_hist.empty and "location" in user_hist.columns) else 0
 
-    # Build feature dict (names must match training)
-    features = {
-        "timestamp": pd.to_datetime(txn_ts).isoformat(),
-        "amount": amount,
-        "hour": int(pd.to_datetime(txn_ts).hour),
-        "is_weekend": 1 if pd.to_datetime(txn_ts).day_name() in ["Saturday", "Sunday"] else 0,
+    device_location_ratio = user_device_count / (user_location_count + 1)
+
+    # avg_time_gap_prev3
+    if not user_hist.empty and "timestamp" in user_hist.columns:
+        # create time diffs series
+        diffs = user_hist.sort_values(
+            "timestamp")["timestamp"].diff().dt.total_seconds().fillna(np.nan)
+        avg_time_gap_prev3 = float(diffs.rolling(3).mean(
+        ).iloc[-1]) if len(diffs) >= 1 else float(median_or_default("time_diff_sec", 0.0))
+        if np.isnan(avg_time_gap_prev3) or avg_time_gap_prev3 is None:
+            avg_time_gap_prev3 = float(median_or_default("time_diff_sec", 0.0))
+    else:
+        avg_time_gap_prev3 = float(median_or_default("time_diff_sec", 0.0))
+
+    # peer_spend_ratio: amount / median merchant amount
+    if (merchant_id is not None) and ("merchant_id" in hist.columns) and (merchant_id in hist["merchant_id"].values):
+        peers = hist[hist["merchant_id"] == merchant_id]
+        peer_median = peers["amount"].median(
+        ) if not peers.empty else median_amount
+    else:
+        peer_median = median_amount
+    peer_spend_ratio = txn["amount"] / \
+        (peer_median if peer_median != 0 else 1.0)
+
+    # user_risk_score (simple average of device+location risk)
+    user_risk_score = (device_risk_score + location_risk_score) / 2.0
+
+    # days_since_first_txn
+    first_txn_time = None
+    if not user_hist.empty:
+        first_txn_time = user_hist["timestamp"].min()
+        try:
+            days_since_first_txn = int(
+                (txn_ts - pd.to_datetime(first_txn_time)).days)
+        except Exception:
+            days_since_first_txn = 0
+    else:
+        days_since_first_txn = 0
+
+    # txn_amount_ratio_user_avg
+    txn_amount_ratio_user_avg = txn["amount"] / (user_avg_amount + 1)
+
+    # Build base dict (with exact names requested)
+    base = {
+        "timestamp": txn_ts.isoformat(),
+        "amount": txn["amount"],
+        "is_fraud": 0,
+        "hour": hour,
+        "is_weekend": is_weekend,
         "user_txn_count": user_txn_count,
         "user_txn_sum": user_txn_sum,
         "user_avg_amount": user_avg_amount,
@@ -324,7 +318,7 @@ def build_features_from_raw(raw_txn: dict, model_feature_list: list):
         "merchant_fraud_rate": merchant_fraud_rate,
         "device_risk_score": device_risk_score,
         "location_risk_score": location_risk_score,
-        "location_device_interaction": location_device_interaction,
+        "location_device_interaction": device_location_interaction,
         "txn_count_1h": txn_count_1h,
         "txn_count_24h": txn_count_24h,
         "is_high_amount": is_high_amount,
@@ -334,92 +328,67 @@ def build_features_from_raw(raw_txn: dict, model_feature_list: list):
         "is_risky_location": is_risky_location,
         "weighted_amount": weighted_amount,
         "user_risk_score": user_risk_score,
-        "days_since_first_txn": 0,  # will compute below if history present
-        "txn_amount_ratio_user_avg": amount / (user_avg_amount + 1e-9),
-        "is_night": 1 if int(pd.to_datetime(txn_ts).hour) in [0, 1, 2, 3, 4, 5] else 0,
+        "days_since_first_txn": days_since_first_txn,
+        "txn_amount_ratio_user_avg": txn_amount_ratio_user_avg,
+        "is_night": is_night,
         "user_fraud_rate": user_fraud_rate,
         "merchant_user_overlap": merchant_user_overlap,
         "device_txn_count": device_txn_count,
         "rolling_fraud_rate_user_7d": rolling_fraud_rate_user_7d,
-        "time_diff_sec": time_diff_sec,
-        "txns_in_last_5min": txns_in_last_5min,
+        "time_diff_sec": time_diff_sec if not pd.isna(time_diff_sec) else 0.0,
+        "txns_in_last_5min": int(txns_in_last_5min),
         "avg_time_gap_prev3": avg_time_gap_prev3,
         "user_device_count": user_device_count,
         "user_location_count": user_location_count,
         "device_location_ratio": device_location_ratio,
-        "merchant_past_fraud_rate": merchant_fraud_rate,
+        "merchant_past_fraud_rate": merchant_past_fraud_rate,
         "txn_order": txn_order,
         "recent_txn_weight": recent_txn_weight,
-        "peer_spend_ratio": peer_spend_ratio,
-        # categorical one-hot placeholders (explicit names from training)
-        "transaction_type_purchase": 1 if transaction_type == "purchase" else 0,
-        "transaction_type_top-up": 1 if transaction_type == "top-up" else 0,
-        "transaction_type_transfer": 1 if transaction_type == "transfer" else 0,
-        "device_type_Web": 1 if device_type == "Web" else 0,
-        "device_type_iOS": 1 if device_type == "iOS" else 0,
-        "day_of_week_Monday": 1 if pd.to_datetime(txn_ts).day_name() == "Monday" else 0,
-        "day_of_week_Saturday": 1 if pd.to_datetime(txn_ts).day_name() == "Saturday" else 0,
-        "day_of_week_Sunday": 1 if pd.to_datetime(txn_ts).day_name() == "Sunday" else 0,
-        "day_of_week_Thursday": 1 if pd.to_datetime(txn_ts).day_name() == "Thursday" else 0,
-        "day_of_week_Tuesday": 1 if pd.to_datetime(txn_ts).day_name() == "Tuesday" else 0,
-        "day_of_week_Wednesday": 1 if pd.to_datetime(txn_ts).day_name() == "Wednesday" else 0,
+        "peer_spend_ratio": peer_spend_ratio
     }
 
-    # compute days_since_first_txn
-    if not user_hist.empty and "timestamp" in user_hist.columns:
-        first_ts = pd.to_datetime(user_hist["timestamp"]).min()
-        features["days_since_first_txn"] = int(
-            (pd.to_datetime(txn_ts) - pd.to_datetime(first_ts)).days)
-    else:
-        features["days_since_first_txn"] = 0
+    # Add categorical one-hot exact keys (ensure same names as model_feature_list)
+    # transaction_type fields:
+    base[f"transaction_type_{transaction_type}"] = 1
+    # device type:
+    base[f"device_type_{device_type}"] = 1
+    # day_of_week:
+    base[f"day_of_week_{day_of_week}"] = 1
 
-    # Ensure all model features present; fallback to training median or 0
-    final = {}
+    # Add raw categorical fields for history
+    base["transaction_type"] = transaction_type
+    base["device_type"] = device_type
+    base["location"] = location
+    base["transaction_id"] = txn.get("transaction_id")
+    base["user_id"] = user_id
+    base["merchant_id"] = merchant_id
+    base["timestamp"] = txn_ts.isoformat()
+    base["is_fraud"] = 0  # placeholder
+
+    # Build final ordered feature dict matching model_feature_list (fallback to medians/0)
+    feature_series = {}
     for feat in model_feature_list:
-        if feat in features:
-            final[feat] = features[feat]
+        if feat in base:
+            feature_series[feat] = base[feat]
         else:
-            # fallback to training median or 0
-            if feat in training_df.columns:
+            # fallback: if present in training_df use median, else 0
+            if training_df is not None and feat in training_df.columns:
                 try:
-                    final[feat] = float(training_df[feat].median())
+                    val = float(training_df[feat].median(
+                    )) if training_df[feat].dtype.kind in "fi" else 0
                 except Exception:
-                    final[feat] = 0.0
+                    val = 0
+                feature_series[feat] = val
             else:
-                final[feat] = 0.0
+                # ensure booleans 0/1 for expected dummies
+                feature_series[feat] = 0
 
-    # convert bools -> ints and ensure numeric dtype
-    for k, v in final.items():
-        if isinstance(v, (bool, np.bool_)):
-            final[k] = int(v)
-        elif v is None:
-            final[k] = 0.0
+    # Convert to DataFrame single-row and ensure numeric dtypes
+    feature_vector = pd.DataFrame([feature_series], columns=model_feature_list)
+    feature_vector = feature_vector.apply(
+        pd.to_numeric, errors="coerce").fillna(0)
 
-    feature_vector = pd.DataFrame([final], columns=model_feature_list)
+    # Prepare enriched_for_history dict to be saved (flat)
+    enriched_for_history = base.copy()
 
-    # write last feature vector for debugging
-    try:
-        _write_last_feature_vector(feature_vector.copy())
-    except Exception:
-        pass
-
-    enriched = {
-        "transaction_id": transaction_id,
-        "user_id": user_id,
-        "merchant_id": merchant_id,
-        "amount": amount,
-        "timestamp": pd.to_datetime(txn_ts).isoformat(),
-        "device_type": device_type,
-        "transaction_type": transaction_type,
-        "location": location,
-        "user_txn_count": user_txn_count,
-        "user_avg_amount": user_avg_amount,
-        "amount_zscore_user": amount_zscore_user,
-        "merchant_fraud_rate": merchant_fraud_rate,
-        "txn_count_24h": txn_count_24h,
-        "txn_count_1h": txn_count_1h,
-        "rolling_fraud_rate_user_7d": rolling_fraud_rate_user_7d,
-        "is_fraud": 0
-    }
-
-    return feature_vector, enriched
+    return feature_vector, enriched_for_history
